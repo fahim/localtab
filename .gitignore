@@ -1,7 +1,3 @@
-.env
-venv
-.venv/
-.venv-workers/
-.dev.vars
-.wrangler/
-python_modules/
+.DS_Store
+node_modules/
+coverage/
