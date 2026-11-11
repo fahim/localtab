@@ -1,3 +1,4 @@
+import { prepareOrganization, commitOrganization } from "./lib/organize.js";
 import { mountPalette } from "./palette-ui.js";
 import { CHROME_DESTINATIONS, getSearchResults } from "./lib/search.js";
 import { rememberRecentTab, removeRecentTab, setAliasForUrl } from "./lib/storage.js";
@@ -23,9 +24,15 @@ async function activeTab() {
   return tab;
 }
 
-async function handleMessage(rawMessage) {
+async function handleMessage(rawMessage, sender) {
   const message = parseRuntimeMessage(rawMessage);
   switch (message.type) {
+    case "PREPARE_ORGANIZATION": {
+      const tab = sender.tab || await activeTab();
+      return prepareOrganization(tab?.windowId);
+    }
+    case "COMMIT_ORGANIZATION":
+      return commitOrganization(message);
     case "GET_INDEX":
       return getSearchResults(message.query, message.filter);
     case "ACTIVATE_TAB": {
@@ -99,7 +106,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: false, error: "Untrusted message sender." });
     return false;
   }
-  handleMessage(message)
+  handleMessage(message, sender)
     .then(data => sendResponse({ ok: true, data }))
     .catch(error => sendResponse({ ok: false, error: error?.message || "Request failed." }));
   return true;

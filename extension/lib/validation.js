@@ -3,7 +3,7 @@ import { MAX_ALIAS_LENGTH } from "./storage.js";
 const MAX_QUERY_LENGTH = 500;
 const FILTERS = new Set(["all", "tabs", "bookmarks", "web"]);
 const MESSAGE_TYPES = new Set([
-  "GET_INDEX", "ACTIVATE_TAB", "OPEN_URL", "OPEN_SEARCH",
+  "PREPARE_ORGANIZATION", "COMMIT_ORGANIZATION", "GET_INDEX", "ACTIVATE_TAB", "OPEN_URL", "OPEN_SEARCH",
   "OPEN_CHROME_DESTINATION", "SET_ALIAS", "POPUP_READY",
 ]);
 
@@ -42,6 +42,25 @@ export function parseRuntimeMessage(message) {
   if (!isRecord(message) || !MESSAGE_TYPES.has(message.type)) throw new Error("Unknown message type.");
 
   switch (message.type) {
+    case "PREPARE_ORGANIZATION":
+      onlyKeys(message, ["type"]);
+      return { type: message.type };
+    case "COMMIT_ORGANIZATION": {
+      onlyKeys(message, ["type", "draftId", "folders"]);
+      if (!Array.isArray(message.folders) || !message.folders.length || message.folders.length > 1000) throw new Error("Invalid folders.");
+      const folders = message.folders.map(folder => {
+        if (!isRecord(folder)) throw new Error("Invalid folder.");
+        onlyKeys(folder, ["id", "name", "items"]);
+        if (!Array.isArray(folder.items) || folder.items.length > 10000) throw new Error("Invalid bookmarks.");
+        return { id: boundedString(folder.id, 128, "folder id"), name: boundedString(folder.name, 120, "folder name"), items: folder.items.map(item => {
+          if (!isRecord(item)) throw new Error("Invalid bookmark.");
+          onlyKeys(item, ["id", "title"]);
+          return { id: boundedString(item.id, 128, "bookmark id"), title: boundedString(item.title, 300, "bookmark title") };
+        }) };
+      });
+      if (new Set(folders.map(folder => folder.id)).size !== folders.length) throw new Error("Duplicate folders.");
+      return { type: message.type, draftId: boundedString(message.draftId, 128, "draftId"), folders };
+    }
     case "GET_INDEX": {
       onlyKeys(message, ["type", "query", "filter"]);
       const query = typeof message.query === "string" ? message.query.trim() : "";

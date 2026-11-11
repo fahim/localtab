@@ -1,18 +1,41 @@
 export function mountPalette(configuration = {}) {
   const mode = configuration.mode === "popup" ? "popup" : "overlay";
+  const pageDocument = globalThis.document;
+  const previousFocus = pageDocument.activeElement;
   const hostId = "__localtab_palette__";
-  const existing = document.getElementById(hostId);
+  const existing = pageDocument.getElementById(hostId);
   if (existing) {
-    if (mode === "overlay") existing.remove();
+    if (mode === "overlay") existing.__localtabClose?.();
     return;
   }
 
-  const host = document.createElement("div");
+  const host = pageDocument.createElement("div");
   host.id = hostId;
   if (mode === "overlay") {
     host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;display:block";
   }
-  const shadow = host.attachShadow({ mode: "closed" });
+  const outerShadow = host.attachShadow({ mode: "closed" });
+  let document = pageDocument;
+  let shadow = outerShadow;
+  if (mode === "overlay") {
+    // Events inside a browsing context do not propagate to the parent page,
+    // including page capture listeners registered before LocalTab opened.
+    const frame = pageDocument.createElement("iframe");
+    frame.title = "LocalTab command palette";
+    frame.style.cssText = "display:block;width:100%;height:100%;border:0;background:transparent;color-scheme:normal";
+    outerShadow.append(frame);
+    pageDocument.documentElement.append(host);
+    document = frame.contentDocument;
+    if (!document?.body) {
+      host.remove();
+      throw new Error("Unable to initialize the LocalTab frame.");
+    }
+    document.documentElement.style.background = "transparent";
+    document.body.style.cssText = "margin:0;background:transparent";
+    const content = document.createElement("div");
+    document.body.append(content);
+    shadow = content.attachShadow({ mode: "closed" });
+  }
   const style = document.createElement("style");
   style.textContent = `
     :host { all: initial; color-scheme: dark; }
@@ -44,6 +67,17 @@ export function mountPalette(configuration = {}) {
     .alias:hover { background: #353d50; color: #fff; }
     .empty, .status { padding: 24px 16px; color: #858da0; text-align: center; font: 500 13px/1.5 system-ui; }
     .status.error { color: #ff929d; }
+    [hidden] { display: none !important; }
+    button:disabled { opacity: .5; cursor: default; }
+    input:not([type=search]):focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid #9d93ff; outline-offset: 2px; }
+    .organize { margin-left: auto; background: #282e3d; border-radius: 8px; padding: 6px 9px; }
+    .folder { padding: 10px; border-bottom: 1px solid #353d50; }
+    .folder-head { display: flex; align-items: center; gap: 8px; }
+    .folder input[type=checkbox] { flex: none; width: 18px; height: 18px; }
+    .folder input[type=text] { width: 100%; font-size: 14px; padding: 7px; border: 1px solid #3c455a; border-radius: 6px; }
+    .bookmark-preview { padding: 10px 0; }
+    summary { cursor: pointer; padding: 8px 0; font: 500 12px system-ui; }
+    .organizer-message { white-space: pre-wrap; font: 500 12px/1.5 system-ui; padding: 8px 0; }
     .editor { padding: 16px; }
     .editor-title { margin-bottom: 10px; color: #aab3c7; font: 600 12px system-ui; }
     .editor-box { width: 100%; padding: 10px 12px; border: 1px solid #3c455a; border-radius: 10px; background: #10141e; }
@@ -86,16 +120,20 @@ export function mountPalette(configuration = {}) {
     filterBar.append(button);
   }
 
+  const organize = make("button", "organize", "Organize tabs");
+  organize.type = "button";
+  filterBar.append(organize);
   const results = make("div", "results");
   results.setAttribute("role", "listbox");
   panel.append(searchRow, filterBar, results);
   backdrop.append(panel);
   shadow.append(style, backdrop);
-  (mode === "popup" ? document.body : document.documentElement).append(host);
+  if (mode === "popup") document.body.append(host);
 
   let visibleResults = [];
   let selectedIndex = 0;
   let refreshSequence = 0;
+  let organizing = false;
 
   const send = async message => {
     const response = await chrome.runtime.sendMessage(message);
@@ -105,8 +143,37 @@ export function mountPalette(configuration = {}) {
 
   const close = () => {
     if (mode === "popup") window.close();
-    else host.remove();
+    else {
+      host.remove();
+      if (previousFocus?.isConnected) previousFocus.focus({ preventScroll: true });
+    }
   };
+
+  host.__localtabClose = close;
+  let closeAfterEscape = false;
+  // Keep native editing and button/checkbox behavior; only constrain focus at
+  // the modal boundaries. The frame itself provides keyboard isolation.
+  shadow.addEventListener("keydown", event => {
+    if (event.key === "Tab") {
+      const controls = [...shadow.querySelectorAll("input, button, summary, [tabindex]")]
+        .filter(element => !element.disabled && element.tabIndex >= 0 && element.getClientRects().length && !element.closest("[hidden]"));
+      const index = controls.indexOf(shadow.activeElement);
+      if (controls.length && (index < 0 || (!event.shiftKey && index === controls.length - 1) || (event.shiftKey && index === 0))) {
+        event.preventDefault();
+        controls[event.shiftKey ? controls.length - 1 : 0].focus();
+      }
+    } else if (event.key === "Escape" && !event.defaultPrevented) {
+      event.preventDefault();
+      closeAfterEscape = true;
+    }
+  });
+  document.addEventListener("keyup", event => {
+    if (event.key === "Escape" && closeAfterEscape) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      close();
+    }
+  }, { capture: true });
 
   const showError = error => {
     results.replaceChildren(make("div", "status error", error?.message || "Something went wrong."));
@@ -134,6 +201,7 @@ export function mountPalette(configuration = {}) {
   };
 
   const startAliasEditor = item => {
+    ++refreshSequence;
     input.disabled = true;
     filterBar.hidden = true;
     const editor = make("div", "editor");
@@ -166,11 +234,110 @@ export function mountPalette(configuration = {}) {
     save.addEventListener("click", () => finish(true));
     aliasInput.addEventListener("keydown", event => {
       if (event.key === "Enter") finish(true);
-      if (event.key === "Escape") finish(false);
+      if (event.key === "Escape") { event.preventDefault(); finish(false); }
     });
     aliasInput.focus();
     aliasInput.select();
   };
+
+  const startOrganization = async () => {
+    organizing = true;
+    ++refreshSequence;
+    input.disabled = true;
+    filterBar.hidden = true;
+    visibleResults = [];
+    results.removeAttribute("role");
+    results.replaceChildren(make("div", "status", "Preparing folder suggestions…"));
+    const editor = make("div", "editor");
+    const note = make("div", "organizer-message");
+    const actions = make("div", "editor-actions");
+    const cancel = make("button", "", "Cancel");
+    const save = make("button", "save", "Bookmark selected folders");
+    cancel.type = save.type = "button";
+    const finish = () => {
+      organizing = false;
+      input.disabled = false;
+      filterBar.hidden = false;
+      results.setAttribute("role", "listbox");
+      refresh(); input.focus();
+    };
+    cancel.addEventListener("click", finish);
+    editor.addEventListener("keydown", event => {
+      if (event.key === "Escape" && !cancel.disabled) { event.preventDefault(); finish(); }
+    });
+    note.setAttribute("role", "status");
+    actions.append(cancel, save);
+    try {
+      const draft = await send({ type: "PREPARE_ORGANIZATION" });
+      if (!host.isConnected) return;
+      editor.append(make("div", "editor-title", "Save to Other Bookmarks → LocalTab"));
+      note.textContent = `${draft.skipped} tabs skipped (unsupported, duplicate, or already saved URLs).`;
+      editor.append(note);
+      const controls = [];
+      for (const folder of draft.folders) {
+        const section = make("div", "folder");
+        const head = make("div", "folder-head");
+        const checked = make("input"); checked.type = "checkbox"; checked.checked = true;
+        checked.setAttribute("aria-label", `Save folder ${folder.name}`);
+        const name = make("input"); name.type = "text"; name.value = folder.name; name.maxLength = 120;
+        name.setAttribute("aria-label", "Folder name");
+        head.append(checked, name);
+        const details = make("details");
+        details.append(make("summary", "", `${folder.items.length} bookmarks — review titles`));
+        const items = folder.items.map(item => {
+          const row = make("div", "bookmark-preview");
+          const title = make("input"); title.type = "text"; title.value = item.title; title.maxLength = 300;
+          title.setAttribute("aria-label", "Bookmark title");
+          const original = make("span", "subtitle", `Original: ${item.originalTitle}`); original.title = item.originalTitle;
+          const url = make("span", "subtitle", item.url); url.title = item.url;
+          row.append(title, original, url); details.append(row);
+          return { id: item.id, title, row };
+        });
+        section.append(head, details); editor.append(section);
+        controls.push({ id: folder.id, checked, name, items, section });
+      }
+      const validate = () => {
+        const selected = controls.filter(folder => folder.checked.checked);
+        save.disabled = !selected.length || selected.some(folder => !folder.name.value.trim() || folder.items.some(item => !item.title.value.trim()));
+      };
+      editor.addEventListener("input", validate);
+      editor.append(actions);
+      results.replaceChildren(editor);
+      if (!draft.folders.length) note.textContent += " No new bookmarks to save.";
+      validate();
+      save.addEventListener("click", async () => {
+        const folders = controls.filter(folder => folder.checked.checked).map(folder => ({
+          id: folder.id, name: folder.name.value, items: folder.items.map(item => ({ id: item.id, title: item.title.value })),
+        }));
+        for (const control of editor.querySelectorAll("input, button")) control.disabled = true;
+        try {
+          const outcome = await send({ type: "COMMIT_ORGANIZATION", draftId: draft.id, folders });
+          note.textContent = `${outcome.saved} saved, ${outcome.skipped} already saved, ${outcome.failed.length} failed.`;
+          if (outcome.failed.length) {
+            const failures = new Set(outcome.failed.map(item => item.id));
+            note.textContent += "\n" + [...new Set(outcome.failed.map(item => item.error))].join("\n");
+            for (const folder of controls) {
+              folder.checked.checked = folder.items.some(item => failures.has(item.id));
+              folder.section.hidden = !folder.checked.checked;
+              for (const item of folder.items) item.row.hidden = !failures.has(item.id);
+            }
+            save.textContent = "Retry failed bookmarks";
+            for (const control of editor.querySelectorAll("input, button")) control.disabled = false;
+            validate();
+          } else { save.hidden = true; cancel.textContent = "Done"; cancel.disabled = false; }
+        } catch (error) {
+          note.textContent = error.message;
+          for (const control of editor.querySelectorAll("input, button")) control.disabled = false;
+          validate();
+        }
+      });
+      cancel.focus();
+    } catch (error) {
+      note.textContent = error.message; save.hidden = true;
+      editor.append(note, actions); results.replaceChildren(editor); cancel.focus();
+    }
+  };
+  organize.addEventListener("click", startOrganization);
 
   const render = items => {
     results.replaceChildren();
@@ -208,6 +375,7 @@ export function mountPalette(configuration = {}) {
   };
 
   async function refresh() {
+    if (organizing) return;
     const sequence = ++refreshSequence;
     try {
       const items = await send({ type: "GET_INDEX", query: input.value, filter: activeFilter });
@@ -235,7 +403,7 @@ export function mountPalette(configuration = {}) {
       runResult(visibleResults[selectedIndex]);
     } else if (event.key === "Escape") {
       event.preventDefault();
-      close();
+      closeAfterEscape = true;
     }
   });
   if (mode === "overlay") {
